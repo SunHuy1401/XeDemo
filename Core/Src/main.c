@@ -32,8 +32,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MAX_PWM 1000
-#define ADC_COMPA 2000
-#define SPEED 500
+#define SPEED 220 // Hạ tốc độ từ 400 xuống 220 để xe 4WD có đủ thời gian bám vạch trên sa bàn ngắn
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,7 +48,16 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
+TIM_HandleTypeDef htim3; // Khai báo bộ định thời phần cứng Timer 3 cho ngắt chu kỳ 2ms (500 Hz)
 
+// Mảng lưu giá trị cực tiểu (nền trắng) và cực đại (vạch đen) của 8 cảm biến khi calib
+volatile uint16_t sensor_min[8] = {4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+volatile uint16_t sensor_max[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+// Ngưỡng phân định màu Trắng và Đen riêng biệt cho từng mắt cảm biến
+// Khởi tạo ngưỡng mặc định an toàn: Chân 4 được đặt vùng trễ siêu hẹp (3895 / 3945) quanh điểm giữa để phản hồi digital tức thì
+volatile uint16_t threshold_white[8] = {3200, 3650, 3200, 3200, 3895, 3200, 3200, 3200};
+volatile uint16_t threshold_black[8] = {3500, 3850, 3500, 3500, 3945, 3500, 3500, 3500};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,16 +68,20 @@ static void MX_ADC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-// Thêm từ khóa volatile cho các biến dùng chung giữa ngắt (EXTI/DMA) và vòng lặp chính
+static void MX_TIM3_Init(void); // Khai báo nguyên mẫu hàm khởi tạo Timer 3
+void calibrate_sensors(void);   // Khai báo nguyên mẫu hàm hiệu chuẩn (calib) cảm biến
+
+// Thêm từ khóa volatile cho các biến dùng chung giữa ngắt (EXTI/DMA/TIM3) và vòng lặp chính
 // để tránh trình biên dịch tối ưu hóa lưu biến vào thanh ghi CPU gây mất phản hồi
 volatile uint8_t is_avoiding = 0;
 volatile uint16_t adc[8];
+volatile uint16_t sensor_digital[8]; // uint16_t để STM32CubeIDE hiển thị số 0 và 1 thuần túy
 
-float error = 0;
-float last_error = 0;
-float I = 0;
-float Kp = 35.0, Ki = 0.0, Kd = 15.0;
-float PID_value = 0;
+float error = 0.0f;
+float last_error = 0.0f;
+float I = 0.0f;
+float Kp = 110.0f, Ki = 0.0f, Kd = 80.0f; // Tăng Kp = 110 để tạo lực lái mạnh mẽ cho khung xe 4WD khi vào cua gắt
+volatile float PID_value = 0.0f; // volatile để biến được đồng bộ tức thì giữa ngắt và main
 
 void delay_us(uint16_t us) {								// Hàm delay theo us để gửi xung cho cảm biến siêu âm
     __HAL_TIM_SET_COUNTER(&htim2, 0);
@@ -85,73 +97,83 @@ void pulse(GPIO_TypeDef *Port, uint16_t pin, uint8_t t){    // Tạo xung kích 
 }
 
 void Set_Motor_Speed(int16_t speed_left, int16_t speed_right) {
-	    uint16_t pwm_left = 0;
-	    uint16_t pwm_right = 0;
+    static int16_t prev_speed_left = 0x7FFF;
+    static int16_t prev_speed_right = 0x7FFF;
 
-	    // Giới hạn giá trị PWM trong dải [-MAX_PWM, MAX_PWM]
-	    if (speed_left > MAX_PWM) speed_left = MAX_PWM;
-	    else if (speed_left < -MAX_PWM) speed_left = -MAX_PWM;
-	    if (speed_right > MAX_PWM) speed_right = MAX_PWM;
-	    else if (speed_right < -MAX_PWM) speed_right = -MAX_PWM;
+    // Giới hạn giá trị PWM trong dải [-MAX_PWM, MAX_PWM]
+    if (speed_left > MAX_PWM) speed_left = MAX_PWM;
+    else if (speed_left < -MAX_PWM) speed_left = -MAX_PWM;
+    if (speed_right > MAX_PWM) speed_right = MAX_PWM;
+    else if (speed_right < -MAX_PWM) speed_right = -MAX_PWM;
 
-	    // Điều khiển chiều quay và độ rộng xung động cơ trái (PB12, PB13, TIM1_CH1)
-	    if (speed_left >= 0) {
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-	        pwm_left = speed_left;
-	    } else {
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-	        pwm_left = -speed_left;
-	    }
+    // Tối ưu hóa: Nếu tốc độ không đổi so với lần xuất trước, thoát ngay lập tức
+    // Tránh spam ghi thanh ghi GPIO/TIM hàng triệu lần/giây, giải phóng bus và giảm nhiệt vi điều khiển
+    if (speed_left == prev_speed_left && speed_right == prev_speed_right) {
+        return;
+    }
+    prev_speed_left = speed_left;
+    prev_speed_right = speed_right;
 
-	    // Điều khiển chiều quay và độ rộng xung động cơ phải (PB14, PB15, TIM1_CH2)
-	    if (speed_right >= 0) {
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
-	        pwm_right = speed_right;
-	    } else {
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
-	        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-	        pwm_right = -speed_right;
-	    }
-	    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_left);
-	    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_right);
+    uint16_t pwm_left = 0;
+    uint16_t pwm_right = 0;
+
+    // Điều khiển chiều quay và độ rộng xung động cơ trái (PB12, PB13, TIM1_CH1)
+    // Đảo ngược chiều để quay TIẾN khi speed_left >= 0 (PB12=RESET, PB13=SET)
+    if (speed_left >= 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+        pwm_left = (uint16_t)speed_left;
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+        pwm_left = (uint16_t)(-speed_left);
+    }
+
+    // Điều khiển chiều quay và độ rộng xung động cơ phải (PB14, PB15, TIM1_CH2)
+    // Đảo ngược chiều để quay TIẾN khi speed_right >= 0 (PB14=SET, PB15=RESET)
+    if (speed_right >= 0) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+        pwm_right = (uint16_t)speed_right;
+    } else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+        pwm_right = (uint16_t)(-speed_right);
+    }
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm_left);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pwm_right);
 }
 
 void pid_calculate(){
-	uint8_t weight[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-	float setpoint = 3.5;
+	float setpoint = 3.5f; // Điểm cân bằng trung tâm của 6 cảm biến (kênh 1 đến 6): (1 + 6) / 2 = 3.5
 	uint32_t sum_value = 0;
 	uint32_t weighted_sum = 0;
-	float position = 0;
+	float position = 0.0f;
 
-	for (int i = 0; i < 8; i++) {
-	    if (adc[i] > ADC_COMPA) {
-	        weighted_sum += weight[i] * adc[i];
-	        sum_value += adc[i];
+	// Bỏ qua 2 kênh ngoài cùng (kênh 0 và kênh 7), chỉ tính toán trên 6 kênh bên trong từ 1 đến 6
+	for (int i = 1; i <= 6; i++) {
+	    if (sensor_digital[i] == 1) {
+	        weighted_sum += i;
+	        sum_value++;
 	    }
 	}
 
 	if (sum_value > 0) {
-	    // SỬA: Ép kiểu float cho cả tử và mẫu để phép chia giữ lại phần thập phân,
-	    // giúp tính toán vị trí vạch line mịn màng thay vì bị cắt thành số nguyên
 	    position = (float)weighted_sum / (float)sum_value;
 	    error = setpoint - position;
-	    // SỬA: ĐÃ XÓA dòng "last_error = error;" ở đây!
-	    // Trước đó dòng này làm cho (error - last_error) luôn bằng 0, triệt tiêu khâu vi phân D.
 	} else {
-	    // Khi mất vạch line hoàn toàn, nhớ hướng lệch trước đó để tiếp tục bẻ lái gắt tìm lại line
-	    if (last_error > 0) {
-	        error = 4.0;
+	    // Khi mất line: Bẻ lái theo hướng lệch gần nhất để xe nhanh chóng quay lại line
+	    if (last_error > 0.0f) {
+	        error = 2.5f;
+	    } else if (last_error < 0.0f) {
+	        error = -2.5f;
 	    } else {
-	        error = -4.0;
+	        error = 0.0f; // Vừa khởi động chưa thấy line: Giữ thẳng tìm line
 	    }
 	}
 
 	float P = error;
-	// SỬA: Bây giờ last_error vẫn giữ giá trị của chu kỳ trước, khâu D hoạt động chuẩn xác để chống lắc
-	float D = error - last_error;
+	float D = error - last_error; // Khâu D chống rung lắc xe
 	I += error;
 
 	// Giới hạn chống bão hòa tích phân (Anti-windup)
@@ -159,7 +181,7 @@ void pid_calculate(){
 	else if (I < -1000.0f) I = -1000.0f;
 
 	PID_value = (Kp * P) + (Ki * I) + (Kd * D);
-	last_error = error; // Cập nhật last_error ở cuối hàm cho chu kỳ tiếp theo
+	last_error = error; // Cập nhật last_error cho chu kỳ tiếp theo
 }
 void avoid(void) {
     static uint8_t state = 0;
@@ -214,8 +236,8 @@ void avoid(void) {
             }
             break;
         case 7:
-            // SỬA: Dùng hằng số ADC_COMPA đồng nhất; bổ sung timeout 2000ms để dừng xe nếu xe chạy trượt khỏi vạch line
-            if (adc[3] > ADC_COMPA || adc[4] > ADC_COMPA) {
+            // Tối ưu hóa: Dùng trực tiếp giá trị đã lọc Schmitt Trigger sensor_digital thay vì so sánh ADC thô
+            if (sensor_digital[3] == 1 || sensor_digital[4] == 1) {
                 Set_Motor_Speed(500, -500);
                 tick = HAL_GetTick();
                 state = 8;
@@ -301,17 +323,25 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  MX_TIM3_Init(); // Khởi tạo bộ định thời Timer 3
   HAL_TIM_Base_Start(&htim2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  __HAL_TIM_MOE_ENABLE(&htim1);
 
-  // SỬA: Hiệu chuẩn phần cứng ADC trước khi kích hoạt DMA để loại bỏ sai số offset trên STM32F1
+  // Hiệu chuẩn phần cứng ADC trước khi kích hoạt DMA để loại bỏ sai số offset trên STM32F1
   HAL_ADCEx_Calibration_Start(&hadc1);
 
-  // SỬA: Khởi động ADC đọc liên tục 8 kênh qua DMA vào mảng adc[8]
+  // Khởi động ADC đọc liên tục 8 kênh qua DMA vào mảng adc[8]
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc, 8);
+  HAL_Delay(50); // Chờ DMA ổn định vài vòng quét ban đầu
 
-  uint32_t pid_loop_tick = 0;
+  // THỰC HIỆN CALIB CẢM BIẾN (3.5 giây, nhấp nháy đèn LED PC13 để người dùng rê xe qua vạch line)
+  calibrate_sensors();
+
+  // Khởi động ngắt định thời cứng siêu tốc 2ms (500 Hz) trên Timer 3
+  HAL_TIM_Base_Start_IT(&htim3);
+
   uint32_t ultrasonic_tick = 0;
   /* USER CODE END 2 */
 
@@ -323,22 +353,21 @@ int main(void)
 		  avoid();
 	  }
 	  else {
-		  // SỬA: Tách chu kỳ phát xung siêu âm riêng (mỗi 60ms) theo chuẩn cảm biến HC-SR04,
-		  // tránh phát dồn dập 20ms làm nhận nhầm sóng phản xạ của lần phát trước
+		  // Tách chu kỳ phát xung siêu âm riêng (mỗi 60ms) theo chuẩn cảm biến HC-SR04
 		  if (HAL_GetTick() - ultrasonic_tick >= 60) {
 		      ultrasonic_tick = HAL_GetTick();
 		      pulse(GPIOB, GPIO_PIN_10, 10);
 		  }
 
-		  // Chu kỳ tính toán và điều khiển động cơ PID chạy ổn định mỗi 20ms
-		  if (HAL_GetTick() - pid_loop_tick >= 20) {
-		      pid_loop_tick = HAL_GetTick();
-		      pid_calculate();
-		      // Cập nhật tốc độ 2 bánh xe
-		      // Lưu ý: Nếu thực tế xe lệch trái nhưng lại rẽ trái (ngược hướng), chỉ cần đổi dấu:
-		      // Set_Motor_Speed(SPEED - PID_value, SPEED + PID_value);
-		      Set_Motor_Speed(SPEED + PID_value, SPEED - PID_value);
-		  }
+		  // Hàm chính CHỈ xuất giá trị PID (đã được tính sẵn từ ngắt 2ms) ra 2 động cơ
+		  int16_t speed_left = (int16_t)(SPEED - PID_value);
+		  int16_t speed_right = (int16_t)(SPEED + PID_value);
+
+		  // Giới hạn tốc độ không âm khi dò line: Bánh trong chỉ hãm dừng lại làm tâm quay (không quay lùi giật xe)
+		  if (speed_left < 0) speed_left = 0;
+		  if (speed_right < 0) speed_right = 0;
+
+		  Set_Motor_Speed(speed_left, speed_right);
 	  }
 
     /* USER CODE END WHILE */
@@ -362,8 +391,6 @@ void SystemClock_Config(void)
   * in the RCC_OscInitTypeDef structure.
   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  // SỬA: Đổi từ RCC_HSE_OFF sang RCC_HSE_ON. Nếu HSE tắt mà PLL dùng nguồn HSE,
-  // HAL_RCC_OscConfig sẽ trả về HAL_ERROR và làm chip treo vĩnh viễn trong Error_Handler()
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
@@ -428,10 +455,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  // SỬA: Cấu hình tuần tự 8 mắt đọc cảm biến từ PA0 (ADC_CHANNEL_0) đến PA7 (ADC_CHANNEL_7)
-  // và tăng SamplingTime lên 55.5 chu kỳ để chống nhiễu xuyên kênh (crosstalk) giữa các mắt đọc
-
-  /** Configure Regular Channel - Rank 1: PA0 (Sensor 0)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_REGULAR_RANK_1;
@@ -441,7 +465,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 2: PA1 (Sensor 1)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_2;
@@ -450,7 +474,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 3: PA2 (Sensor 2)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_3;
@@ -459,7 +483,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 4: PA3 (Sensor 3)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_3;
   sConfig.Rank = ADC_REGULAR_RANK_4;
@@ -468,7 +492,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 5: PA4 (Sensor 4)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_4;
   sConfig.Rank = ADC_REGULAR_RANK_5;
@@ -477,7 +501,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 6: PA5 (Sensor 5)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_5;
   sConfig.Rank = ADC_REGULAR_RANK_6;
@@ -486,7 +510,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 7: PA6 (Sensor 6)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_7;
@@ -495,7 +519,7 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure Regular Channel - Rank 8: PA7 (Sensor 7)
+  /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_7;
   sConfig.Rank = ADC_REGULAR_RANK_8;
@@ -530,8 +554,6 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  // SỬA: Đổi Prescaler = 71 và Period = 999 để tạo tần số PWM 1 kHz (72MHz / (71+1) / (999+1) = 1kHz)
-  // Khớp dải điều khiển MAX_PWM = 1000 (100% duty cycle) và SPEED = 500 (50% duty cycle)
   htim1.Init.Prescaler = 71;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim1.Init.Period = 999;
@@ -696,7 +718,161 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/**
+  * @brief TIM3 Initialization Function (Ngắt định thời chu kỳ 2ms = 500Hz - Siêu tốc)
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+  __HAL_RCC_TIM3_CLK_ENABLE();
 
+  htim3.Instance = TIM3;
+  // Timer 3 cấp từ APB1 (72 MHz).
+  // Prescaler = 71  -> Tần số đếm = 72 MHz / (71 + 1) = 1 MHz (mỗi tick = đúng 1 micro-giây)
+  // Period = 1999   -> Chu kỳ tràn = (1999 + 1) * 1 us = 2,000 us = 2 ms (Tần số ngắt 500 Hz)
+  htim3.Init.Prescaler = 71;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 1999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Cấu hình ưu tiên ngắt NVIC cho TIM3 (ưu tiên 2, sau EXTI và DMA) */
+  HAL_NVIC_SetPriority(TIM3_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(TIM3_IRQn);
+}
+
+/**
+  * @brief Hàm phục vụ ngắt phần cứng của Timer 3
+  */
+void TIM3_IRQHandler(void)
+{
+  HAL_TIM_IRQHandler(&htim3);
+}
+
+/**
+  * @brief Callback ngắt chu kỳ Timer 3: Chạy chuẩn xác mỗi 2ms (500 Hz)
+  *        Đọc cảm biến ADC, chuyển đổi sang Digital 0/1 và tính toán PID siêu tốc
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM3)
+  {
+    // Bỏ qua 2 kênh ngoài cùng: Cố định mức 0 cho kênh 0 và kênh 7
+    sensor_digital[0] = 0;
+    sensor_digital[7] = 0;
+
+    // 1. Chỉ đọc và chuyển đổi 6 kênh bên trong (từ kênh 1 đến kênh 6)
+    // Caching adc[i] vào biến cục bộ val để tránh đọc lặp lại từ RAM/DMA
+    for (int i = 1; i <= 6; i++) {
+      uint16_t val = adc[i];
+      if (val < threshold_white[i]) {
+        sensor_digital[i] = 0; // Màu trắng (nhỏ hơn ngưỡng trắng của mắt i)
+      } else if (val > threshold_black[i]) {
+        sensor_digital[i] = 1; // Màu đen (lớn hơn ngưỡng đen của mắt i)
+      }
+      // Nằm trong khoảng [threshold_white[i], threshold_black[i]]: Giữ nguyên trạng thái cũ (chống rung mép vạch)
+    }
+
+    // 2. Tính toán PID luôn trong ngắt với tốc độ cao 500 lần/giây (chu kỳ 2ms)
+    if (is_avoiding == 0) {
+      pid_calculate();
+    }
+  }
+}
+
+/**
+  * @brief Hàm hiệu chuẩn (calib) cảm biến quang:
+  *        - Chạy trong 3.5 giây ngay khi bật nguồn.
+  *        - Nhấp nháy đèn LED PC13 để báo người dùng rê xe qua vạch line.
+  *        - Bỏ qua 2 kênh ngoài cùng (0 và 7), chỉ calib 6 kênh từ 1 đến 6.
+  *        - Đo giá trị Min (nền trắng) và Max (vạch đen) riêng biệt cho từng cảm biến.
+  *        - Tự động tính toán threshold_white và threshold_black cho từng kênh.
+  *        - Xử lý đặc biệt cho chân 1 và 4 (ít nhạy với màu trắng hơn các mắt khác).
+  */
+void calibrate_sensors(void) {
+    // 1. Cấu hình chân PC13 điều khiển đèn LED báo trạng thái
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_13;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    // 2. Khởi tạo mảng lưu giá trị min và max cho 6 kênh sử dụng (từ 1 đến 6)
+    for (int i = 1; i <= 6; i++) {
+        sensor_min[i] = 4095;
+        sensor_max[i] = 0;
+    }
+
+    uint32_t start_time = HAL_GetTick();
+
+    // 3. Vòng lặp calib kéo dài 3.5 giây: Đọc liên tục ADC cho 6 kênh từ 1 đến 6
+    while (HAL_GetTick() - start_time < 3500) {
+        for (int i = 1; i <= 6; i++) {
+            uint16_t current_val = adc[i];
+            if (current_val < sensor_min[i]) sensor_min[i] = current_val;
+            if (current_val > sensor_max[i]) sensor_max[i] = current_val;
+        }
+
+        // Nhấp nháy đèn PC13 mỗi 100ms (Active Low: 0 = sáng, 1 = tắt)
+        if (((HAL_GetTick() - start_time) / 100) % 2 == 0) {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+        } else {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+        }
+        HAL_Delay(2);
+    }
+
+    // 4. Tính toán ngưỡng Schmitt Trigger riêng biệt cho 6 mắt cảm biến (1 đến 6)
+    for (int i = 1; i <= 6; i++) {
+        uint16_t span = (sensor_max[i] > sensor_min[i]) ? (sensor_max[i] - sensor_min[i]) : 0;
+
+        // Hạ ngưỡng kiểm tra xuống span > 60 để nhận diện được các cảm biến dải đo hẹp (như chân 4)
+        if (span > 60) {
+            uint16_t mid = sensor_min[i] + (span / 2);
+
+            // Riêng chân 4: Kém nhạy màu trắng và dải đo hẹp -> Dùng vùng trễ siêu hẹp quanh điểm giữa mid
+            // để chuyển đổi trạng thái digital tức thì (Fast Response), không còn bị trễ
+            if (i == 4) {
+                uint16_t delta = (span * 6) / 100; // Vùng trễ chỉ 6% dải đo (khoảng 15-20 đơn vị ADC)
+                if (delta < 15) delta = 15;
+                if (delta > 25) delta = 25;
+                threshold_white[4] = mid - delta;
+                threshold_black[4] = mid + delta;
+            } else if (i == 1 || sensor_min[i] > 3200) {
+                // Chân 1 hoặc mắt có mức trắng cao: Vùng trễ hẹp quanh điểm giữa
+                uint16_t delta = (span * 10) / 100;
+                threshold_white[i] = mid - delta;
+                threshold_black[i] = mid + delta;
+            } else {
+                // Các chân bình thường: Điểm giữa ± 15% span
+                uint16_t delta = (span * 15) / 100;
+                threshold_white[i] = mid - delta;
+                threshold_black[i] = mid + delta;
+            }
+        } else {
+            // Trường hợp mắt không quét qua vạch: Gán ngưỡng mặc định siêu nhạy
+            if (i == 4) {
+                threshold_white[4] = 3895;
+                threshold_black[4] = 3945;
+            } else if (i == 1) {
+                threshold_white[1] = 3680;
+                threshold_black[1] = 3780;
+            }
+        }
+    }
+
+    // 5. Báo hiệu hoàn tất: LED PC13 sáng liên tục 500ms rồi tắt
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+}
 /* USER CODE END 4 */
 
 /**
